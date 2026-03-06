@@ -1,0 +1,7 @@
+google-adk
+google-genai
+groq
+gTTS
+pyttsx3
+requests
+pypdf
