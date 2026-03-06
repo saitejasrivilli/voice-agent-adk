@@ -7,9 +7,10 @@
 #   ✅ RAG with BM25-style retrieval
 #   ✅ Reasoning traces
 #   ✅ Input guardrails + safety filter
-#   ✅ Metrics dashboard (latency, tokens, tool usage)
+#   ✅ Token bucket rate limiting (10 req/min per user)
+#   ✅ Metrics dashboard (latency, tokens, tool usage, rate blocks)
 #   ✅ Multi-user session isolation
-#   ✅ Voice I/O (Whisper + gTTS)
+#   ✅ Voice I/O (Whisper + pyttsx3/gTTS)
 # Hugging Face Spaces — Python 3.11
 # Secret: GROQ_API_KEY (https://console.groq.com)
 # ============================================================
@@ -61,6 +62,8 @@ def get_metrics_md() -> str:
     p95_lat  = sorted(metrics["latencies"])[int(len(metrics["latencies"]) * 0.95)] if len(metrics["latencies"]) >= 20 else max(metrics["latencies"])
     tool_str = "\n".join([f"  - `{k}`: {v} calls" for k, v in sorted(metrics["tool_calls"].items(), key=lambda x: -x[1])]) or "  - None yet"
     dom_str  = "\n".join([f"  - `{k}`: {v} queries" for k, v in sorted(metrics["domain_usage"].items(), key=lambda x: -x[1])])
+    total_blocked = sum(b["blocked"] for b in rate_buckets.values())
+    active_users  = len(rate_buckets)
     return f"""### 📊 Live Metrics Dashboard
 
 | Metric | Value |
@@ -70,6 +73,8 @@ def get_metrics_md() -> str:
 | P95 Latency | **{p95_lat:.0f} ms** |
 | Avg Tokens/Query | **{avg_tok:.0f}** |
 | Guardrail Blocks | **{metrics['guardrail_blocks']}** |
+| Rate Limit Blocks | **{total_blocked}** |
+| Active Users | **{active_users}** |
 | Errors | **{metrics['errors']}** |
 
 **Tool Call Distribution:**
@@ -77,6 +82,8 @@ def get_metrics_md() -> str:
 
 **Domain Usage:**
 {dom_str}
+
+**Rate Limit Config:** `{RATE_LIMIT_CAPACITY} req burst` · `1 token per {RATE_LIMIT_REFILL_S:.0f}s` · `~10 req/min per user`
 """
 
 # ── GUARDRAILS ────────────────────────────────────────────────
@@ -96,6 +103,51 @@ def check_guardrails(text: str) -> tuple[bool, str]:
     if len(text) > 2000:
         return False, "⚠️ Query too long (max 2000 characters)."
     return True, ""
+
+# ── RATE LIMITER ──────────────────────────────────────────────
+# Token bucket algorithm per user:
+#   - Each user gets a bucket of 10 tokens
+#   - 1 token refills every 6 seconds (= 10 requests/minute max)
+#   - Each query costs 1 token
+#   - Burst of up to 10 requests allowed, then throttled
+
+RATE_LIMIT_CAPACITY  = 10      # max burst
+RATE_LIMIT_REFILL_S  = 6.0     # seconds per token refill
+RATE_LIMIT_WINDOW_S  = 60      # rolling window for stats
+
+rate_buckets: dict = {}   # user_id -> {"tokens": float, "last_refill": float, "blocked": int}
+
+def check_rate_limit(user_id: str) -> tuple[bool, str]:
+    """
+    Token bucket rate limiter.
+    Returns (is_allowed, message).
+    """
+    now = time.time()
+
+    if user_id not in rate_buckets:
+        rate_buckets[user_id] = {
+            "tokens":      float(RATE_LIMIT_CAPACITY),
+            "last_refill": now,
+            "blocked":     0,
+        }
+
+    bucket = rate_buckets[user_id]
+
+    # Refill tokens based on elapsed time
+    elapsed        = now - bucket["last_refill"]
+    refill_amount  = elapsed / RATE_LIMIT_REFILL_S
+    bucket["tokens"]      = min(RATE_LIMIT_CAPACITY, bucket["tokens"] + refill_amount)
+    bucket["last_refill"] = now
+
+    if bucket["tokens"] >= 1.0:
+        bucket["tokens"] -= 1.0
+        remaining = int(bucket["tokens"])
+        return True, f"✅ {remaining} requests remaining in burst capacity"
+    else:
+        bucket["blocked"] += 1
+        metrics["guardrail_blocks"] += 1
+        wait_s = (1.0 - bucket["tokens"]) * RATE_LIMIT_REFILL_S
+        return False, f"⏱️ Rate limit exceeded. Please wait {wait_s:.1f}s before your next query. (Max {RATE_LIMIT_CAPACITY} requests/minute)"
 
 # ── RAG STORE (BM25-style TF-IDF scoring) ────────────────────
 rag_chunks = []
@@ -459,6 +511,11 @@ def process_query(user_input: str, domain: str, user_id: str) -> dict:
     is_safe, reason = check_guardrails(user_input)
     if not is_safe:
         return {"plan": reason, "tool_results": {}, "thinking": "", "answer": reason, "latency_ms": 0, "tokens": 0}
+
+    # 2. Rate limit check
+    is_allowed, rate_msg = check_rate_limit(user_id)
+    if not is_allowed:
+        return {"plan": rate_msg, "tool_results": {}, "thinking": "", "answer": rate_msg, "latency_ms": 0, "tokens": 0}
 
     # 2. Get user session
     sess = get_or_create_user(user_id)
