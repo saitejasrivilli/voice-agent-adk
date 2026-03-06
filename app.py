@@ -1,7 +1,7 @@
 # ============================================================
 # Multi-Agent Voice AI — Google ADK + Groq
 # Google Cloud AI Research JD-aligned features:
-#   ✅ Google ADK multi-agent orchestration
+#   ✅ Google ADK + LiteLlm → Groq LLaMA 3.3 70B (fully native ADK)
 #   ✅ Domain-specialized agents (Healthcare / Finance / Retail / General)
 #   ✅ Parallel async tool execution
 #   ✅ RAG with BM25-style retrieval
@@ -19,6 +19,7 @@ import os, json, textwrap, datetime, requests, re, asyncio, time, uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from google.adk.agents import Agent
+from google.adk.models.lite_llm import LiteLlm
 from google.adk.runners import InMemoryRunner
 from google.adk.tools import FunctionTool
 from google.genai import types as genai_types
@@ -31,7 +32,13 @@ if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY not set. Add it in Space Settings → Secrets.")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
+# LiteLlm reads GROQ_API_KEY from env automatically — no dummy Gemini key needed
+os.environ["GROQ_API_KEY"] = GROQ_API_KEY
+# ADK still needs this set to something to avoid import errors
 os.environ.setdefault("GOOGLE_API_KEY", "dummy")
+
+# ADK LiteLlm model — uses Groq LLaMA 3.3 70B as the real backbone
+ADK_MODEL = LiteLlm(model="groq/llama-3.3-70b-versatile")
 executor_pool = ThreadPoolExecutor(max_workers=4)
 print("✅ Config ready")
 
@@ -62,8 +69,12 @@ def get_metrics_md() -> str:
     p95_lat  = sorted(metrics["latencies"])[int(len(metrics["latencies"]) * 0.95)] if len(metrics["latencies"]) >= 20 else max(metrics["latencies"])
     tool_str = "\n".join([f"  - `{k}`: {v} calls" for k, v in sorted(metrics["tool_calls"].items(), key=lambda x: -x[1])]) or "  - None yet"
     dom_str  = "\n".join([f"  - `{k}`: {v} queries" for k, v in sorted(metrics["domain_usage"].items(), key=lambda x: -x[1])])
-    total_blocked = sum(b["blocked"] for b in rate_buckets.values())
-    active_users  = len(rate_buckets)
+    try:
+        total_blocked = sum(b["blocked"] for b in rate_buckets.values())
+        active_users  = len(rate_buckets)
+    except NameError:
+        total_blocked = 0
+        active_users  = 0
     return f"""### 📊 Live Metrics Dashboard
 
 | Metric | Value |
@@ -210,20 +221,69 @@ def web_search(query: str) -> str:
     except Exception as e:
         return f"Search error: {e}"
 
+# US state abbreviation → full name map for geocoding matching
+US_STATES = {
+    "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California",
+    "CO":"Colorado","CT":"Connecticut","DE":"Delaware","FL":"Florida","GA":"Georgia",
+    "HI":"Hawaii","ID":"Idaho","IL":"Illinois","IN":"Indiana","IA":"Iowa","KS":"Kansas",
+    "KY":"Kentucky","LA":"Louisiana","ME":"Maine","MD":"Maryland","MA":"Massachusetts",
+    "MI":"Michigan","MN":"Minnesota","MS":"Mississippi","MO":"Missouri","MT":"Montana",
+    "NE":"Nebraska","NV":"Nevada","NH":"New Hampshire","NJ":"New Jersey","NM":"New Mexico",
+    "NY":"New York","NC":"North Carolina","ND":"North Dakota","OH":"Ohio","OK":"Oklahoma",
+    "OR":"Oregon","PA":"Pennsylvania","RI":"Rhode Island","SC":"South Carolina",
+    "SD":"South Dakota","TN":"Tennessee","TX":"Texas","UT":"Utah","VT":"Vermont",
+    "VA":"Virginia","WA":"Washington","WV":"West Virginia","WI":"Wisconsin","WY":"Wyoming",
+    "DC":"District of Columbia",
+}
+
 def get_weather(city: str) -> str:
-    """Get current weather for a city. Input should be just the city name."""
+    """Get current weather. Accepts 'City', 'City, State', or 'City, Country'."""
     try:
-        geo = requests.get(
-            f"https://geocoding-api.open-meteo.com/v1/search?name={requests.utils.quote(city)}&count=1", timeout=5
-        ).json()
-        if not geo.get("results"):
-            return f"City '{city}' not found."
-        loc = geo["results"][0]
-        w   = requests.get(
+        candidates = [city.strip()]
+        if "," in city:
+            candidates.append(city.split(",")[0].strip())
+
+        # Resolve state hint — expand abbreviation to full name
+        state_hint = ""
+        if "," in city:
+            raw_hint   = city.split(",")[1].strip().upper()
+            state_hint = US_STATES.get(raw_hint, raw_hint)  # e.g. VA → Virginia
+
+        loc = None
+        for candidate in candidates:
+            geo = requests.get(
+                f"https://geocoding-api.open-meteo.com/v1/search?name={requests.utils.quote(candidate)}&count=10",
+                timeout=5
+            ).json()
+            results = geo.get("results", [])
+            if not results:
+                continue
+            if state_hint:
+                for r in results:
+                    admin = r.get("admin1", "").upper()
+                    if state_hint.upper() in admin:
+                        loc = r
+                        break
+            if not loc:
+                loc = results[0]
+            break
+
+        if not loc:
+            return f"City not found: '{city}'. Try just the city name."
+
+        w = requests.get(
             f"https://api.open-meteo.com/v1/forecast?latitude={loc['latitude']}"
-            f"&longitude={loc['longitude']}&current_weather=true&temperature_unit=celsius", timeout=5
+            f"&longitude={loc['longitude']}&current_weather=true&temperature_unit=celsius",
+            timeout=5
         ).json()["current_weather"]
-        return f"{loc['name']}: {w['temperature']}°C, wind {w['windspeed']} km/h"
+
+        admin   = loc.get("admin1", "")
+        country = loc.get("country", "")
+        label   = loc["name"]
+        if admin:   label += f", {admin}"
+        if country: label += f", {country}"
+        f_temp  = w["temperature"] * 9/5 + 32
+        return f"{label}: {w['temperature']}°C ({f_temp:.1f}°F), wind {w['windspeed']} km/h"
     except Exception as e:
         return f"Weather error: {e}"
 
@@ -238,11 +298,15 @@ def calculate(expression: str) -> str:
 def get_stock_price(symbol: str) -> str:
     """Get current stock price for a ticker like AAPL, TSLA, GOOGL, MSFT."""
     try:
-        url  = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol.upper()}?interval=1d&range=1d"
+        # Clean symbol — extract uppercase ticker if mixed with text
+        clean = re.sub(r"[^A-Za-z]", " ", symbol).split()
+        # Pick the longest all-caps word as the ticker, fallback to first word
+        ticker = next((w for w in clean if w.isupper() and 1 < len(w) <= 5), clean[0] if clean else symbol).upper()
+        url  = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1d"
         data = requests.get(url, timeout=5, headers={"User-Agent": "Mozilla/5.0"}).json()
         price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        name  = data["chart"]["result"][0]["meta"].get("longName", symbol.upper())
-        return f"{name} ({symbol.upper()}): ${price:.2f}"
+        name  = data["chart"]["result"][0]["meta"].get("longName", ticker)
+        return f"{name} ({ticker}): ${price:.2f}"
     except Exception as e:
         return f"Stock error: {e}"
 
@@ -369,30 +433,76 @@ def groq_complete(system: str, user: str, max_tokens: int = 768) -> tuple[str, i
 # ── PARALLEL TOOL EXECUTION ───────────────────────────────────
 
 PLANNER_SYSTEM = textwrap.dedent("""
-    You are a planner agent. Analyze the user's request and respond in EXACTLY this format:
+    You are a planner agent. Analyze the user request and respond in EXACTLY this format (no extra text):
     INTENT: <what the user wants>
-    TOOLS_NEEDED: <comma-separated list from: web_search, get_weather, calculate, get_stock_price, search_documents, drug_interaction_check, financial_risk_score, product_sentiment, none>
-    QUERIES: <pipe-separated query for each tool, in same order as TOOLS_NEEDED>
+    TOOLS_NEEDED: <comma-separated from: web_search, get_weather, calculate, get_stock_price, search_documents, drug_interaction_check, financial_risk_score, product_sentiment, none>
+    QUERIES: <pipe-separated query per tool, same order — copy exact city/ticker/expression from user>
     TASK: <one clear sentence for the executor>
 
-    Examples:
-    TOOLS_NEEDED: get_stock_price, calculate
-    QUERIES: AAPL | 185 * 0.15
+    CRITICAL RULES:
+    - For get_weather: QUERIES must be the EXACT location from the user (e.g. "Arlington, VA" not just "Arlington")
+    - For get_stock_price: QUERIES must be just the ticker symbol (e.g. "AAPL")
+    - For calculate: QUERIES must be a math expression (e.g. "10000 * 1.07 ** 5")
+    - For conversational/general questions (who, what, why, how, tell me about): use web_search or none
+    - For greetings or chitchat: TOOLS_NEEDED: none
+    - For follow-up questions using "he/she/it/they": use web_search with the full topic from context
 
+    Examples:
+    User: "weather in Arlington, VA"
+    TOOLS_NEEDED: get_weather
+    QUERIES: Arlington, VA
+
+    User: "AAPL stock price"
+    TOOLS_NEEDED: get_stock_price
+    QUERIES: AAPL
+
+    User: "15% of 340"
+    TOOLS_NEEDED: calculate
+    QUERIES: 340 * 0.15
+
+    User: "who invented the telephone"
+    TOOLS_NEEDED: web_search
+    QUERIES: who invented the telephone
+
+    User: "when did he die" (after asking about Alexander Graham Bell)
+    TOOLS_NEEDED: web_search
+    QUERIES: Alexander Graham Bell death year
+
+    User: "what is machine learning"
+    TOOLS_NEEDED: web_search
+    QUERIES: what is machine learning
+
+    User: "hello" or "hi" or "thanks"
     TOOLS_NEEDED: none
     QUERIES: none
+
+    User: "risk score for AAPL, TSLA"
+    TOOLS_NEEDED: financial_risk_score
+    QUERIES: AAPL, TSLA
+
+    User: "check interaction between aspirin and ibuprofen"
+    TOOLS_NEEDED: drug_interaction_check
+    QUERIES: aspirin, ibuprofen
 """).strip()
 
 REASONING_SYSTEM = textwrap.dedent("""
-    You are a reasoning agent. Think step by step before answering.
-    Format EXACTLY as:
+    You are a helpful voice assistant that also shows your reasoning.
+    Given a question and optional tool results, respond in EXACTLY this format:
+
     THINKING:
-    Step 1: <observation>
-    Step 2: <analysis>
-    Step 3: <conclusion>
+    Step 1: <what the user is asking>
+    Step 2: <what data/context is available>
+    Step 3: <how to best answer>
 
     ANSWER:
-    <final answer, max 3 sentences, natural spoken language>
+    <final answer in natural spoken language, max 3 sentences, warm and conversational>
+
+    Rules:
+    - If tool results are provided, use them as the primary source of truth
+    - If no tool results, answer from your own knowledge
+    - Never say "I don't have data" if you can answer from knowledge
+    - For greetings, respond warmly without steps
+    - Always sound like a helpful human assistant, not a robot
 """).strip()
 
 def run_tools_in_parallel(tools_needed: list, queries: list) -> dict:
@@ -429,14 +539,14 @@ def build_adk_agent(domain: str) -> tuple:
 
     executor = Agent(
         name=f"executor_{domain.split()[1].lower()}",
-        model="gemini-2.0-flash",
+        model=ADK_MODEL,   # Google ADK + LiteLlm → Groq LLaMA 3.3 70B
         description=f"Executor agent for {domain} domain.",
         instruction=domain_cfg["system"],
         tools=domain_tools,
     )
     planner = Agent(
         name=f"planner_{domain.split()[1].lower()}",
-        model="gemini-2.0-flash",
+        model=ADK_MODEL,   # Google ADK + LiteLlm → Groq LLaMA 3.3 70B
         description=f"Planner agent for {domain} domain.",
         instruction=PLANNER_SYSTEM,
     )
@@ -472,6 +582,25 @@ for d in DOMAINS:
         "executor": InMemoryRunner(agent=domain_agents[d]["executor"]),
     }
 
+# ── PERSISTENT EVENT LOOP ────────────────────────────────────
+# asyncio.run() creates a NEW loop every call — this destroys ADK sessions.
+# We run ONE persistent loop in a background thread so sessions survive.
+import threading, concurrent.futures as _cf
+
+_adk_loop = asyncio.new_event_loop()
+
+def _start_loop(loop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+_adk_thread = threading.Thread(target=_start_loop, args=(_adk_loop,), daemon=True)
+_adk_thread.start()
+
+def _run_in_loop(coro, timeout=30):
+    """Submit a coroutine to the persistent ADK loop and block until done."""
+    future = asyncio.run_coroutine_threadsafe(coro, _adk_loop)
+    return future.result(timeout=timeout)
+
 async def _ensure_adk_session(user_id: str, domain: str):
     sess = get_or_create_user(user_id)
     if domain not in sess["adk_sessions"]:
@@ -485,10 +614,10 @@ async def _ensure_adk_session(user_id: str, domain: str):
         sess["adk_sessions"][domain] = {"planner": ps, "executor": es}
     return sess["adk_sessions"][domain]
 
-async def _run_adk(runner, session_id: str, text: str) -> str:
+async def _run_adk(runner, session_id: str, text: str, user_id: str = "user") -> str:
     result = ""
     async for event in runner.run_async(
-        user_id="user",
+        user_id=user_id,
         session_id=session_id,
         new_message=genai_types.Content(role="user", parts=[genai_types.Part(text=text)])
     ):
@@ -499,6 +628,12 @@ async def _run_adk(runner, session_id: str, text: str) -> str:
     return result.strip()
 
 print("✅ ADK runners ready for all domains")
+
+# Fallback instruction when ADK runner fails
+EXECUTOR_INSTRUCTION = textwrap.dedent("""
+    You are a helpful voice assistant. Answer clearly and concisely in under 4 sentences.
+    Use any tool data provided. Sound natural and conversational.
+""").strip()
 
 # ── MAIN PIPELINE ─────────────────────────────────────────────
 
@@ -517,7 +652,7 @@ def process_query(user_input: str, domain: str, user_id: str) -> dict:
     if not is_allowed:
         return {"plan": rate_msg, "tool_results": {}, "thinking": "", "answer": rate_msg, "latency_ms": 0, "tokens": 0}
 
-    # 2. Get user session
+    # 3. Get user session
     sess = get_or_create_user(user_id)
     context = ""
     if sess["history"]:
@@ -526,30 +661,35 @@ def process_query(user_input: str, domain: str, user_id: str) -> dict:
             [f"User: {h['user']}\nAssistant: {h['assistant']}" for h in recent]
         ) + "\n\n"
 
-    # 3. Planner — identify tools needed
+    # 4. Planner — identify tools needed
     plan_input = context + f"Domain: {domain}\nUser query: {user_input}"
     plan, plan_tokens = groq_complete(PLANNER_SYSTEM, plan_input)
     total_tokens += plan_tokens
 
-    # 4. Parse tool list + queries from plan
+    # 5. Parse tool list + queries from plan
     tools_needed, queries = [], []
     for line in plan.splitlines():
         if line.startswith("TOOLS_NEEDED:"):
-            tools_needed = [t.strip() for t in line.split(":", 1)[1].split(",") if t.strip() != "none"]
+            tools_needed = [t.strip() for t in line.split(":", 1)[1].split(",")
+                           if t.strip() and t.strip().lower() != "none"]
         elif line.startswith("QUERIES:"):
-            queries = [q.strip() for q in line.split(":", 1)[1].split("|")]
+            queries = [q.strip() for q in line.split(":", 1)[1].split("|")
+                      if q.strip() and q.strip().lower() != "none"]
 
     # Pad queries if needed
     while len(queries) < len(tools_needed):
         queries.append(user_input)
 
-    # 5. Parallel tool execution
+    # 6. Parallel tool execution
     tool_results = run_tools_in_parallel(tools_needed, queries)
     tools_used   = list(tool_results.keys())
 
-    # 6. Reasoning trace
+    # 7. Reasoning trace
     tool_summary = "\n".join([f"{k}: {v}" for k, v in tool_results.items()])
-    reasoning_input = f"{context}Question: {user_input}\nTool results:\n{tool_summary}"
+    if tool_summary:
+        reasoning_input = f"{context}Question: {user_input}\nTool data:\n{tool_summary}\nAnswer using the tool data above."
+    else:
+        reasoning_input = f"{context}Question: {user_input}\nAnswer from your knowledge."
     raw_reasoning, r_tokens = groq_complete(REASONING_SYSTEM, reasoning_input)
     total_tokens += r_tokens
 
@@ -561,29 +701,39 @@ def process_query(user_input: str, domain: str, user_id: str) -> dict:
         answer   = raw_reasoning
         thinking = "Reasoning trace not parsed."
 
-    # 7. ADK executor for final answer (with session isolation per user)
-    executor_prompt = f"{context}User question: {user_input}\n"
+    # 8. ADK executor for final answer (with session isolation per user)
+    executor_prompt = ""
+    if context:
+        executor_prompt += context
+    executor_prompt += f"User question: {user_input}\n"
     if tool_results:
-        executor_prompt += "Tool data:\n" + tool_summary + "\n"
-    executor_prompt += "Give a clear, natural spoken answer."
+        tool_lines = "\n".join([f"- {k}: {v}" for k, v in tool_results.items()])
+        executor_prompt += f"Real-time data from tools:\n{tool_lines}\n"
+        executor_prompt += "Use the tool data as your primary source. Answer in natural spoken language, max 3 sentences."
+    else:
+        executor_prompt += "Answer from your knowledge in natural spoken language, max 3 sentences. Be warm and helpful."
 
     try:
-        adk_sessions = asyncio.run(_ensure_adk_session(user_id, domain))
-        adk_answer   = asyncio.run(_run_adk(
+        adk_sessions = _run_in_loop(_ensure_adk_session(user_id, domain))
+        adk_answer   = _run_in_loop(_run_adk(
             adk_runners[domain]["executor"],
             adk_sessions["executor"].id,
-            executor_prompt
+            executor_prompt,
+            user_id=user_id
         ))
         if adk_answer and len(adk_answer) > 10:
             answer = adk_answer
+            print(f"✅ ADK+LiteLlm executor succeeded")
     except Exception as e:
+        # Fallback to direct Groq if ADK runner fails
         print(f"ADK executor fallback: {e}")
+        answer = groq_complete(EXECUTOR_INSTRUCTION, executor_prompt)[0]
 
-    # 8. Record metrics
+    # 9. Record metrics
     latency_ms = (time.time() - start_time) * 1000
     record_metric(domain, latency_ms, total_tokens, tools_used)
 
-    # 9. Update user session
+    # 10. Update user session
     sess["history"].append({"user": user_input, "assistant": answer})
     sess["log"].append({
         "timestamp":    datetime.datetime.now().isoformat(),
@@ -635,10 +785,11 @@ def text_to_speech(text: str) -> str:
         wav_path = "/tmp/response.wav"
         engine.save_to_file(text, wav_path)
         engine.runAndWait()
-        # Convert wav to mp3-compatible format by just renaming — Gradio handles wav too
-        import shutil
-        shutil.copy(wav_path, path.replace(".mp3", ".wav"))
-        return path.replace(".mp3", ".wav")
+        import shutil, os as _os
+        if _os.path.exists(wav_path) and _os.path.getsize(wav_path) > 1000:
+            shutil.copy(wav_path, path.replace(".mp3", ".wav"))
+            return path.replace(".mp3", ".wav")
+        raise RuntimeError("pyttsx3 produced empty/missing file")
     except Exception:
         pass
     # Fallback: gTTS with retry
@@ -725,6 +876,8 @@ def gradio_pipeline(audio_input, text_input, domain, user_id):
 def clear_chat(user_id):
     if user_id in user_sessions:
         user_sessions[user_id]["history"] = []
+        user_sessions[user_id]["log"] = []
+        # Don't reset adk_sessions — ADK sessions are persistent by design
     return "", "", "", "", None, "Session cleared."
 
 # ── BUILD GRADIO UI ──────────────────────────────────────────
